@@ -15,10 +15,11 @@ import base64
 import json
 import os
 import uuid
+import time
 
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request, send_from_directory
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 
 load_dotenv()
 
@@ -45,10 +46,10 @@ EXT_TO_MIME: dict[str, str] = {
     ".webp": "image/webp",
 }
 
-# Pinned to Google's Gemma 4 31B (free) — the top-ranked free vision model on
-# OpenRouter as of mid-2026, with a good speed/smartness balance for PDF +
-# image Q&A. Swap to "openrouter/free" if you'd rather let the router pick.
-MODEL = "google/gemma-4-31b-it:free"
+# Pinned to OpenRouter's dynamic free routing — this allows the router to pick
+# the best available free vision model, reducing the likelihood of hitting
+# a specific model's rate limit.
+MODEL = "openrouter/free"
 
 # In-memory document store: { doc_id -> { b64, kind, media_type, filename } }
 # Lives as long as the server is running.
@@ -101,6 +102,22 @@ def _make_client() -> OpenAI | None:
     if not api_key:
         return None
     return OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+
+
+def _call_openai_with_retry(call_func, max_retries=3):
+    """Call an OpenAI API function with exponential backoff on rate limits."""
+    for attempt in range(max_retries):
+        try:
+            return call_func()
+        except RateLimitError:
+            if attempt == max_retries - 1:
+                raise
+            # Exponential backoff: 2s, 4s, 8s...
+            delay = 2 ** (attempt + 1)
+            time.sleep(delay)
+        except Exception:
+            # Fail immediately for all other errors (Auth, etc.)
+            raise
 
 
 def _file_content_part(doc: dict) -> list:
@@ -235,12 +252,12 @@ def summarize():
             yield _sse({"type": "error", "content": "OPENROUTER_API_KEY is not set."})
             return
         try:
-            stream = client.chat.completions.create(
+            stream = _call_openai_with_retry(lambda: client.chat.completions.create(
                 model=MODEL,
                 messages=[{"role": "user", "content": content}],
                 stream=True,
                 extra_body=_extra_body(doc) or None,
-            )
+            ))
             yield from _stream_response(stream, extra_done={"doc_id": doc_id})
         except Exception as exc:  # noqa: BLE001
             yield _sse({"type": "error", "content": _handle_exc(exc)})
@@ -287,12 +304,12 @@ def chat():
             yield _sse({"type": "error", "content": "OPENROUTER_API_KEY is not set."})
             return
         try:
-            stream = client.chat.completions.create(
+            stream = _call_openai_with_retry(lambda: client.chat.completions.create(
                 model=MODEL,
                 messages=api_messages,
                 stream=True,
                 extra_body=_extra_body(doc) or None,
-            )
+            ))
             yield from _stream_response(stream)
         except Exception as exc:  # noqa: BLE001
             yield _sse({"type": "error", "content": _handle_exc(exc)})
